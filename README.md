@@ -96,3 +96,11 @@ This crate is a leaf dependency — it doesn't depend on other ternary crates.
 ## License
 
 MIT
+
+## See Also
+- **ternary-cli** — related
+- **ternary-engine** — related
+- **ternary-protocol** — related
+- **ternary-compiler** — related
+- **ternary-grammar** — related
+
