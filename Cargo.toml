@@ -1,0 +1,8 @@
+[package]
+name = "ternary-command"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Command parsing and dispatch for ternary agents"
+
+[dependencies]
