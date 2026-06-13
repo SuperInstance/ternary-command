@@ -100,6 +100,32 @@ Ternary Command provides the command interface for fleet operations in SuperInst
 
 See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for command architecture.
 
+
+### Alias System
+
+Aliases provide human-friendly shortcuts:
+
+```rust
+registry.alias("ls", "list")
+registry.alias("exit", "quit")
+registry.alias("scan", "sensor_scan_full")
+```
+
+Alias resolution: **O(1)** HashMap lookup. Aliases are transparent — dispatching "ls" invokes the "list" handler with all arguments forwarded. An alias can shadow another alias (chains resolve in **O(K)** for K chained aliases, with cycle detection).
+
+### History and Audit Trail
+
+Every dispatched command is logged with full context:
+
+```
+history: Vec<(CommandContext, CommandResult)>
+
+history query by agent_id: O(N) scan → Vec<(context, result)>
+history query by time range: O(N) scan with timestamp filter
+```
+
+Configurable max history size (default 10,000 entries) with FIFO eviction. The audit trail enables: replay (reconstruct fleet state from command sequence), accountability (who issued what when), and debugging (what command caused the anomaly).
+
 ## References
 
 1. Gamma, E. et al. (1994). *Design Patterns*. Addison-Wesley. Command Pattern.
