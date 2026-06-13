@@ -1,136 +1,204 @@
-# Ternary Command
+# ternary-command
 
-**Ternary Command** provides command parsing and dispatch with ternary outcomes — every command resolves to Success (+1), Partial (0), or Failure (-1), integrating the ternary philosophy into the fleet's command interface.
+A command parsing, dispatch, and audit system where every command execution resolves to one of three outcomes: **Success (+1)**, **Partial (0)**, or **Failure (−1)**. Provides structured parsing, a handler registry, alias expansion, and an append-only history trail.
 
 ## Why It Matters
 
-Command systems usually return binary success/failure, leaving no room for "it partially worked." But fleet operations frequently produce partial results: a sensor scan that gets 70% of readings, a deployment that activates 3 of 4 nodes, or a cache refresh that updates most keys. Ternary Command's three-valued outcome captures this nuance, enabling more sophisticated error handling — Partial results can be used with degraded functionality rather than discarded entirely.
+Standard `Result<T, E>` forces a binary classification: the command either succeeded or it didn't. But fleet agents frequently encounter situations that don't fit:
+
+- A move command that reached the destination but took damage en route.
+- A batch operation where 7 of 10 items succeeded.
+- A query that returned stale data because the canonical source was unreachable.
+
+These are **partial successes** — the agent did something useful, but the operator should be informed. Collapsing to `Ok` hides the problem; collapsing to `Err` discards the work done.
+
+Within the **γ + η = C** framework:
+
+| Symbol | Domain |
+|--------|--------|
+| γ | `CommandResult` ∈ {Success(+1), Partial(0), Failure(−1)} |
+| η | Dispatch decisions: routing verbs to handlers, alias resolution |
+| C | Consistency constraints: registry integrity, history invariants |
 
 ## How It Works
 
-### Command Result
-
-```rust
-enum CommandResult {
-    Success(String),   // +1: fully completed
-    Partial(String),   //  0: partially completed
-    Failure(String),   // -1: failed
-}
-```
-
-Each variant carries a message payload. Helper methods: `is_success()`, `is_partial()`, `is_failure()`, `message()`.
-
-### Command Context
-
-```rust
-CommandContext {
-    agent_id: String,     // who issued the command
-    location: String,     // where it was issued
-    timestamp_ms: u64,    // when (epoch milliseconds)
-}
-```
-
-Context provides audit trail information. Creation with current time: **O(1)**.
-
-### Registry and Dispatch
-
-```rust
-CommandRegistry {
-    commands: HashMap<String, CommandHandler>,
-    aliases: HashMap<String, String>,       // alias → canonical name
-    history: Vec<(CommandContext, CommandResult)>,
-}
-```
-
-- `register(name, handler)` → **O(1)** HashMap insert
-- `dispatch(name, args, context)` → **O(1)** lookup + handler execution
-- Alias resolution: **O(1)** (check aliases HashMap, fall through to canonical)
-
-### History Tracking
-
-Every dispatched command is logged:
+### Command Pipeline
 
 ```
-history.push((context, result))
+Raw Input
+    │
+    ▼
+┌──────────────┐
+│ AliasSystem  │  "n" → "move north"
+└──────┬───────┘
+       │ expanded string
+       ▼
+┌──────────────┐
+│ CommandParser │  split on delimiter, extract verb + args
+└──────┬───────┘
+       │ ParsedCommand { verb, args, raw }
+       ▼
+┌──────────────┐
+│ Registry     │  verb → handler fn lookup
+└──────┬───────┘
+       │ handler(ParsedCommand, CommandContext)
+       ▼
+┌──────────────┐
+│ CommandResult│  Success / Partial / Failure
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│ History      │  append-only audit trail
+└──────────────┘
 ```
 
-History append: **O(1)** amortized. History query by agent: **O(N)** scan. Configurable max history size with FIFO eviction.
+### Parsing
 
-### Alias System
+The parser splits on a configurable delimiter (default: ASCII space), trims whitespace, and discards empty tokens:
 
-```rust
-registry.alias("ls", "list")
-registry.alias("exit", "quit")
+$$\text{tokens} = \text{filter}(\text{trim}(\text{split}(s, d)), \text{non\text{-}empty})$$
+
+The first token is the verb; remaining tokens are positional arguments.
+
+**Complexity**: O(|s|) where |s| is the input length.
+
+### Alias Resolution
+
+Alias resolution replaces the **first token** of the input with its expansion if registered:
+
+```
+Input:    "g sword knight"
+Alias:    "g" → "give"
+Output:   "give sword knight"
 ```
 
-Aliases resolve transparently — dispatching "ls" invokes the "list" handler.
+The system preserves any arguments after the first token. Resolution is O(|first_token|) for HashMap lookup.
+
+### History as a Ring Buffer
+
+`CommandHistory::with_capacity(n)` uses a ring buffer: when full, the oldest entry is removed (O(n) shift due to `Vec::remove(0)`), and the new entry is appended. For production use with large histories, a `VecDeque` would provide O(1) eviction.
+
+### Result Classification
+
+The three outcomes map to ternary values for aggregation:
+
+$$\text{batch\_result} = \begin{cases} +1 & \text{all results are Success} \\ -1 & \text{any result is Failure} \\ \;\;0 & \text{otherwise (mixed, no failure)} \end{cases}$$
+
+This is a **pessimistic partial**: a single failure contaminates the batch, but all-successes is required for a positive result.
+
+### Complexity
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| `parse` | O(|s|) | Single-pass tokenization |
+| `resolve` (alias) | O(1) expected | HashMap lookup + string concat |
+| `register` (handler) | O(1) amortized | HashMap insert |
+| `get` (handler) | O(1) expected | HashMap lookup |
+| `record` (history) | O(1) or O(n) | O(1) if under capacity; O(n) if eviction needed |
+| `by_agent` (history filter) | O(n) | Linear scan |
+| `by_result` (history filter) | O(n) | Linear scan |
 
 ## Quick Start
 
 ```rust
-use ternary_command::{CommandRegistry, CommandResult, CommandContext};
+use ternary_command::{
+    CommandParser, CommandRegistry, CommandContext,
+    CommandResult, AliasSystem, CommandHistory,
+};
+
+// Set up aliases
+let mut aliases = AliasSystem::new();
+aliases.register("n", "move north");
+aliases.register("s", "move south");
+
+// Parse
+let parser = CommandParser::new();
+let expanded = aliases.resolve("n");
+let cmd = parser.parse(&expanded).unwrap();
+assert_eq!(cmd.verb, "move");
+assert_eq!(cmd.args, vec!["north"]);
+
+// Register handlers
+fn handle_move(cmd: &ternary_command::ParsedCommand, _ctx: &CommandContext) -> CommandResult {
+    match cmd.first_arg() {
+        Some("north") => CommandResult::Success("moved north".into()),
+        Some(direction) => CommandResult::Partial(format!("partial: {}", direction)),
+        None => CommandResult::Failure("no direction".into()),
+    }
+}
 
 let mut registry = CommandRegistry::new();
-registry.register("scan", |_args, _ctx| {
-    CommandResult::Success("Scan complete".into())
-});
-registry.register("partial_scan", |_args, _ctx| {
-    CommandResult::Partial("70% coverage".into())
-});
+registry.register("move", handle_move);
 
-let ctx = CommandContext::new("agent-1", "bridge");
-let result = registry.dispatch("scan", &["--full"], &ctx);
+// Dispatch
+let ctx = CommandContext::new("agent-1", "hub");
+let handler = registry.get(&cmd.verb).unwrap();
+let result = handler(&cmd, &ctx);
 assert!(result.is_success());
+
+// Record in history
+let mut history = CommandHistory::new();
+history.record(cmd, ctx, result);
+assert_eq!(history.len(), 1);
 ```
 
 ## API
 
-| Type | Description |
-|------|-------------|
-| `CommandResult` | Success(String), Partial(String), Failure(String) |
-| `CommandContext` | agent_id, location, timestamp_ms |
-| `CommandRegistry` | Register, dispatch, alias, history |
-| `CommandHandler` | `fn(args: &[String], ctx: &CommandContext) -> CommandResult` |
+### `CommandResult`
 
-Key methods: `register()`, `dispatch()`, `alias()`, `history()`.
+```rust
+pub enum CommandResult {
+    Success(String),
+    Partial(String),
+    Failure(String),
+}
+```
+
+Methods: `is_success()`, `is_partial()`, `is_failure()`, `message()`.
+
+### `ParsedCommand`
+
+Fields: `verb: String`, `args: Vec<String>`, `raw: String`. Methods: `first_arg()`, `arg_count()`.
+
+### `CommandContext`
+
+Fields: `agent_id`, `location`, `timestamp_ms`. Constructor: `new(agent_id, location)`, `with_timestamp(...)`.
+
+### `CommandParser`
+
+- `new()` — default space delimiter.
+- `with_delimiter(char)` — custom delimiter.
+- `parse(&str) -> Option<ParsedCommand>` — returns `None` on empty input.
+
+### `CommandRegistry`
+
+- `new()`, `register(verb, handler)`, `get(verb)`, `has(verb)`, `verbs()`, `len()`, `is_empty()`.
+
+### `AliasSystem`
+
+- `new()`, `register(alias, expansion)`, `remove(alias)`, `resolve(input)`, `list()`, `len()`.
+
+### `CommandHistory`
+
+- `new()` — unlimited capacity.
+- `with_capacity(max)` — ring buffer with eviction.
+- `record(cmd, ctx, result)`, `last()`, `by_agent(id)`, `by_result(success_only)`.
 
 ## Architecture Notes
 
-Ternary Command provides the command interface for fleet operations in SuperInstance. In γ + η = C, Success (+1) represents γ (growth — command fully achieved its objective), Failure (-1) represents η (avoidance — command failed, avoid the result), and Partial (0) is the neutral state where some progress was made but the objective wasn't fully met. Integrates with `ternary-captain` for leadership commands and `ternary-channel` for remote command dispatch.
+The handler type is `fn(&ParsedCommand, &CommandContext) -> CommandResult` — a raw function pointer, not a closure or trait object. This keeps the registry `Send + Sync` without allocation, at the cost of preventing closures that capture state. For stateful handlers, the standard pattern is to have the function pointer read from a shared `Arc<Mutex<State>>` stored externally.
 
-See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for command architecture.
+The history trail is designed for **audit**, not replay. It stores `ParsedCommand` snapshots (including the raw input string) and the `CommandContext` (agent + location + timestamp), enabling post-hoc forensic analysis: "what did agent-5 do at 14:23?"
 
-
-### Alias System
-
-Aliases provide human-friendly shortcuts:
-
-```rust
-registry.alias("ls", "list")
-registry.alias("exit", "quit")
-registry.alias("scan", "sensor_scan_full")
-```
-
-Alias resolution: **O(1)** HashMap lookup. Aliases are transparent — dispatching "ls" invokes the "list" handler with all arguments forwarded. An alias can shadow another alias (chains resolve in **O(K)** for K chained aliases, with cycle detection).
-
-### History and Audit Trail
-
-Every dispatched command is logged with full context:
-
-```
-history: Vec<(CommandContext, CommandResult)>
-
-history query by agent_id: O(N) scan → Vec<(context, result)>
-history query by time range: O(N) scan with timestamp filter
-```
-
-Configurable max history size (default 10,000 entries) with FIFO eviction. The audit trail enables: replay (reconstruct fleet state from command sequence), accountability (who issued what when), and debugging (what command caused the anomaly).
+The alias system performs **single-token expansion only**. It does not support chained aliases (alias A → alias B → command) to prevent infinite loops and keep resolution O(1).
 
 ## References
 
-1. Gamma, E. et al. (1994). *Design Patterns*. Addison-Wesley. Command Pattern.
-2. Schedulers and Dispatchers. Linux Kernel Documentation, 2024.
-3. Bustamante, D. (2019). "Command Query Responsibility Segregation (CQRS)." *Microsoft Azure Architecture Center*.
+- **Fowler, M.** (2005). "Command Pattern." In *Patterns of Enterprise Application Architecture*. — Command as a first-class object.
+- **Gamma, E., Helm, R., Johnson, R., & Vlissides, J.** (1994). *Design Patterns*, Ch. 5 — Command pattern for request encapsulation.
+- **Russell, S., & Norvig, P.** (2020). *AI: A Modern Approach* (4th ed.), §2.3 — Agent architectures with percept-action sequences.
+- **Kleene, S. C.** (1952). *Introduction to Metamathematics*. — Three-valued outcome semantics.
 
 ## License
 
